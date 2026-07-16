@@ -147,6 +147,63 @@ def _fix_text_outside_dim(doc, dim_list):
                     e.dxf.insert = (pos.x, 2 * dim_coord - pos.y, 0)
 
 
+def _foundation_kind_label(foundation_type, rock_type):
+    if foundation_type == "rock":
+        return {"nangan1": "岩着・軟岩Ⅰ", "nangan2": "岩着・軟岩Ⅱ以上"}.get(rock_type, f"岩着・{rock_type}")
+    return "直接"
+
+
+def _kiso_segments(foundation_types, rock_types, num_spans):
+    """スパンごとの基礎形式・岩盤区分が同じ連続区間をまとめる。
+    戻り値: [(開始スパン番号, 終了スパン番号(含む), (foundation_type, rock_type)), ...]"""
+    kinds = []
+    for i in range(num_spans):
+        ft = foundation_types[i] if i < len(foundation_types) else None
+        rt = rock_types[i] if (ft == "rock" and i < len(rock_types)) else None
+        kinds.append((ft, rt))
+
+    segments = []
+    seg_start = 0
+    for i in range(1, num_spans):
+        if kinds[i] != kinds[seg_start]:
+            segments.append((seg_start, i - 1, kinds[seg_start]))
+            seg_start = i
+    segments.append((seg_start, num_spans - 1, kinds[seg_start]))
+    return segments
+
+
+def _kind_key(foundation_type, rock_type):
+    return (foundation_type, rock_type if foundation_type == "rock" else None)
+
+
+def _kind_suffix(foundation_type, rock_type):
+    """00_Brock_Tougou.py / 02_Brock_Kiso.py が生成する kiso_data_<suffix>.json のsuffixと一致させる"""
+    if foundation_type == "rock":
+        return {"nangan1": "岩着_軟岩1", "nangan2": "岩着_軟岩2"}.get(rock_type, f"岩着_{rock_type}")
+    return "直接"
+
+
+def _load_kiso_dims(output_dir, cache, foundation_type, rock_type, primary_key, default_h1, default_h2):
+    """(foundation_type, rock_type) に対応する kiso_data.json の H1/H2（mm）を読み込む（キャッシュ付き）。
+    先頭スパンの種類（primary_key）はサフィックスなしのファイルを使う。岩着はH1=H2=0（基礎コン・砕石なし）。"""
+    key = _kind_key(foundation_type, rock_type)
+    if key in cache:
+        return cache[key]
+    if key == primary_key:
+        path = os.path.join(output_dir, "kiso_data.json")
+    else:
+        path = os.path.join(output_dir, f"kiso_data_{_kind_suffix(foundation_type, rock_type)}.json")
+    h1, h2 = default_h1, default_h2
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            kd = json.load(f)
+        dims = kd.get("dimensions", {})
+        h1 = float(dims.get("H1", default_h1))
+        h2 = float(dims.get("H2", default_h2))
+    cache[key] = (h1, h2)
+    return (h1, h2)
+
+
 def main(output_dir, scale=50, **kwargs):
 
     scale = float(scale)
@@ -186,6 +243,27 @@ def main(output_dir, scale=50, **kwargs):
         base_concrete_h = data.get("base_concrete_height", 0.30) * MM
         crushed_stone_h = data.get("crushed_stone_height", 0.15) * MM
 
+    # 基礎コン高さ・砕石高さのスパンごとの解決（岩着区間は基礎コン・砕石ともに無し＝0）
+    _num_spans_kiso   = len(upper_extension)
+    _ft_primary       = data.get("foundation_type", "direct")
+    _rt_primary       = data.get("rock_type")
+    _kiso_primary_key = _kind_key(_ft_primary, _rt_primary)
+    _foundation_types = data.get("foundation_types") or [_ft_primary] * _num_spans_kiso
+    _rock_types       = data.get("rock_types") or [_rt_primary] * _num_spans_kiso
+    _kiso_dims_cache  = {_kiso_primary_key: (base_concrete_h, crushed_stone_h)}
+
+    def _span_kiso_h(span_idx):
+        ft = _foundation_types[span_idx] if span_idx < len(_foundation_types) else _ft_primary
+        rt = _rock_types[span_idx] if span_idx < len(_rock_types) else _rt_primary
+        return _load_kiso_dims(output_dir, _kiso_dims_cache, ft, rt, _kiso_primary_key,
+                                base_concrete_h, crushed_stone_h)
+
+    def _point_kiso_h(point_idx):
+        """測点の基礎コン高さ・砕石高さ（次スパン優先、最終測点は前スパン）"""
+        if _num_spans_kiso <= 0:
+            return (base_concrete_h, crushed_stone_h)
+        return _span_kiso_h(min(point_idx, _num_spans_kiso - 1))
+
     slope_ratio = math.sqrt(1.0 + front_slope ** 2)
 
     # 各スパンの最大延長（上下の長い方）を累積してX座標を構築
@@ -214,7 +292,9 @@ def main(output_dir, scale=50, **kwargs):
             bottom_els.append(bottom * MM)
             umemodoshi_els.append(el * MM)
 
-    global_min_stone_y = min(bottom_els) - base_concrete_h - crushed_stone_h
+    global_min_stone_y = min(
+        bottom_els[_i] - _point_kiso_h(_i)[0] - _point_kiso_h(_i)[1] for _i in range(len(bottom_els))
+    )
     global_dim_bot_y   = global_min_stone_y - dim_offset
     global_max_top_y   = max(top_els)
     global_dim_top_y   = global_max_top_y + dim_offset
@@ -325,9 +405,10 @@ def main(output_dir, scale=50, **kwargs):
 
     GUIDE_OVERSHOOT = 10.0  # ブロック天端・基礎底からの突き出し量（mm）
 
-    for x, top_el, bottom_el in zip(distances, top_els, bottom_els):
+    for _pi, (x, top_el, bottom_el) in enumerate(zip(distances, top_els, bottom_els)):
+        _h1, _h2 = _point_kiso_h(_pi)
         guide_top = top_el + GUIDE_OVERSHOOT
-        guide_bottom = bottom_el - base_concrete_h - crushed_stone_h - GUIDE_OVERSHOOT
+        guide_bottom = bottom_el - _h1 - _h2 - GUIDE_OVERSHOOT
         msp.add_line((x, guide_bottom), (x, guide_top), dxfattribs={"layer": "GUIDE", "linetype": "DASHED"})
 
     for x, el in zip(distances, elevations):
@@ -406,10 +487,11 @@ def main(output_dir, scale=50, **kwargs):
             tx1 = x1 + offset + left_cut
             tx2 = x2 - offset - right_cut
 
-        base_bot1  = bot1 - base_concrete_h
-        base_bot2  = bot2 - base_concrete_h
-        stone_bot1 = base_bot1 - crushed_stone_h
-        stone_bot2 = base_bot2 - crushed_stone_h
+        _span_base_h, _span_stone_h = _span_kiso_h(i)
+        base_bot1  = bot1 - _span_base_h
+        base_bot2  = bot2 - _span_base_h
+        stone_bot1 = base_bot1 - _span_stone_h
+        stone_bot2 = base_bot2 - _span_stone_h
 
         msp.add_line((tx1, top1), (tx2, top2), dxfattribs={"layer": "TOP"})
 
@@ -421,18 +503,23 @@ def main(output_dir, scale=50, **kwargs):
                 msp.add_line((tx2, top2), (tx2, top2 - tenba_t), dxfattribs={"layer": "TOP"})
 
         msp.add_line((bx1, bot1),       (bx2, bot2),       dxfattribs={"layer": "BOTTOM"})
-        msp.add_line((bx1, base_bot1),  (bx2, base_bot2),  dxfattribs={"layer": "BASE"})
-        msp.add_line((bx1, stone_bot1), (bx2, stone_bot2), dxfattribs={"layer": "STONE"})
+        # 岩着区間（基礎コン・砕石高さ=0）は基礎コン・砕石の絵を描かない（直接基礎区間のみ描画）
+        if _span_base_h > 0:
+            msp.add_line((bx1, base_bot1),  (bx2, base_bot2),  dxfattribs={"layer": "BASE"})
+        if _span_stone_h > 0:
+            msp.add_line((bx1, stone_bot1), (bx2, stone_bot2), dxfattribs={"layer": "STONE"})
 
         side_top1 = (top1 - tenba_t) if (has_tenba_con == "y" and tenba_t > 0) else top1
         side_top2 = (top2 - tenba_t) if (has_tenba_con == "y" and tenba_t > 0) else top2
         msp.add_line((tx1, side_top1), (bx1, bot1), dxfattribs={"layer": "SIDE"})
         msp.add_line((tx2, side_top2), (bx2, bot2), dxfattribs={"layer": "SIDE"})
 
-        msp.add_line((bx1, bot1),      (bx1, base_bot1),  dxfattribs={"layer": "BASE"})
-        msp.add_line((bx1, base_bot1), (bx1, stone_bot1), dxfattribs={"layer": "STONE"})
-        msp.add_line((bx2, bot2),      (bx2, base_bot2),  dxfattribs={"layer": "BASE"})
-        msp.add_line((bx2, base_bot2), (bx2, stone_bot2), dxfattribs={"layer": "STONE"})
+        if _span_base_h > 0:
+            msp.add_line((bx1, bot1),      (bx1, base_bot1),  dxfattribs={"layer": "BASE"})
+            msp.add_line((bx2, bot2),      (bx2, base_bot2),  dxfattribs={"layer": "BASE"})
+        if _span_stone_h > 0:
+            msp.add_line((bx1, base_bot1), (bx1, stone_bot1), dxfattribs={"layer": "STONE"})
+            msp.add_line((bx2, base_bot2), (bx2, stone_bot2), dxfattribs={"layer": "STONE"})
 
         if i == 0:
             left_end  = {"tx": tx1, "bx": bx1, "top": top1, "bot": bot1, "base_bot": base_bot1, "stone_bot": stone_bot1}
@@ -466,32 +553,67 @@ def main(output_dir, scale=50, **kwargs):
         })
 
     # =========================================================
-    # ⑤ 埋戻しライン
+    # ⑤ 埋戻しライン（スパンごとの始点/終点の根入れを使う。
+    #    測点配列（embed_depths）は隣接スパンの値を共有してしまうため、
+    #    スパン自身の embed_depth_starts/ends を使ってスパン間の値が混ざらないようにする）
     # =========================================================
+    _embed_starts = data.get("embed_depth_starts")
+    _embed_ends   = data.get("embed_depth_ends")
+
     for i in range(len(distances) - 1):
+        if base_line_type == "tenba_kado":
+            if _embed_starts is not None and _embed_ends is not None and i < len(_embed_starts):
+                e1, e2 = _embed_starts[i], _embed_ends[i]
+            else:
+                e1, e2 = embed_depths[i], embed_depths[i + 1]
+            y1 = bottom_els[i]     + e1 * MM
+            y2 = bottom_els[i + 1] + e2 * MM
+        else:
+            y1 = umemodoshi_els[i]
+            y2 = umemodoshi_els[i + 1]
         msp.add_line(
-            (distances[i],     umemodoshi_els[i]),
-            (distances[i + 1], umemodoshi_els[i + 1]),
+            (distances[i], y1), (distances[i + 1], y2),
             dxfattribs={"layer": "UMEMODOSHI", "linetype": "DASHED"}
         )
 
     # =========================================================
-    # ⑤ 裏砕石底面ライン（backfill_bottoms を JSON から参照）
+    # ⑤ 裏砕石底面ライン（河川・岩着区間のみ。スパンごとの始点/終点を使い、
+    #    スパンをまたいで値が混ざらないようにする）
     # =========================================================
-    saiseki_bots = data.get("backfill_bottoms", [])
-    _is_river_rock = (data.get("structure_type", "").startswith("river") and
-                      data.get("foundation_type") == "rock")
-    if _is_river_rock and saiseki_bots and all(v is not None for v in saiseki_bots):
-        saiseki_bot_els = [bot + sb * MM for bot, sb in zip(bottom_els, saiseki_bots)]
-        for x, sb in zip(distances, saiseki_bot_els):
-            msp.add_line((x - point_size, sb), (x + point_size, sb), dxfattribs={"layer": "STONE"})
-            msp.add_line((x, sb - point_size), (x, sb + point_size), dxfattribs={"layer": "STONE"})
+    _is_river  = data.get("structure_type", "").startswith("river")
+    _bf_starts = data.get("backfill_bottom_starts")
+    _bf_ends   = data.get("backfill_bottom_ends")
+
+    if _is_river and _bf_starts is not None and _bf_ends is not None:
+        _bf_foundation_types = data.get("foundation_types") or [data.get("foundation_type")] * len(_bf_starts)
         for i in range(len(distances) - 1):
-            msp.add_line(
-                (distances[i],   saiseki_bot_els[i]),
-                (distances[i+1], saiseki_bot_els[i+1]),
-                dxfattribs={"layer": "STONE"}
-            )
+            ft = _bf_foundation_types[i] if i < len(_bf_foundation_types) else None
+            if ft != "rock":
+                continue
+            sb1 = _bf_starts[i] if i < len(_bf_starts) else None
+            sb2 = _bf_ends[i]   if i < len(_bf_ends)   else None
+            if sb1 is None or sb2 is None:
+                continue
+            y1 = bottom_els[i]     + sb1 * MM
+            y2 = bottom_els[i + 1] + sb2 * MM
+            for x, y in ((distances[i], y1), (distances[i + 1], y2)):
+                msp.add_line((x - point_size, y), (x + point_size, y), dxfattribs={"layer": "STONE"})
+                msp.add_line((x, y - point_size), (x, y + point_size), dxfattribs={"layer": "STONE"})
+            msp.add_line((distances[i], y1), (distances[i + 1], y2), dxfattribs={"layer": "STONE"})
+    elif _is_river and data.get("foundation_type") == "rock":
+        # 旧形式プロジェクト向けフォールバック（スパンごとのデータが無い場合）
+        saiseki_bots = data.get("backfill_bottoms", [])
+        if saiseki_bots and all(v is not None for v in saiseki_bots):
+            saiseki_bot_els = [bot + sb * MM for bot, sb in zip(bottom_els, saiseki_bots)]
+            for x, sb in zip(distances, saiseki_bot_els):
+                msp.add_line((x - point_size, sb), (x + point_size, sb), dxfattribs={"layer": "STONE"})
+                msp.add_line((x, sb - point_size), (x, sb + point_size), dxfattribs={"layer": "STONE"})
+            for i in range(len(distances) - 1):
+                msp.add_line(
+                    (distances[i],   saiseki_bot_els[i]),
+                    (distances[i+1], saiseki_bot_els[i+1]),
+                    dxfattribs={"layer": "STONE"}
+                )
 
     # =========================================================
     # 小口止コンクリート正面図
@@ -613,10 +735,62 @@ def main(output_dir, scale=50, **kwargs):
     # ② 基礎コンクリート総延長寸法線
     kiso_con_x1     = left_end["bx"]  if left_end  else distances[0]
     kiso_con_x2     = right_end["bx"] if right_end else distances[-1]
-    stone_bot_left  = left_end["stone_bot"]  if left_end  else (bottom_els[0]  - base_concrete_h - crushed_stone_h)
-    stone_bot_right = right_end["stone_bot"] if right_end else (bottom_els[-1] - base_concrete_h - crushed_stone_h)
+    _last_pt_idx    = len(bottom_els) - 1
+    stone_bot_left  = left_end["stone_bot"]  if left_end  else (bottom_els[0]  - _point_kiso_h(0)[0]            - _point_kiso_h(0)[1])
+    stone_bot_right = right_end["stone_bot"] if right_end else (bottom_els[-1] - _point_kiso_h(_last_pt_idx)[0] - _point_kiso_h(_last_pt_idx)[1])
 
     kiso_dim_y = global_dim_bot_y - (8.0 * scale)
+
+    # 基礎形式・岩盤区分が区間で複数種類ある場合、区間ごとの対長を個別の段に追加する
+    # （全体合計の対長線はこの外側＝さらに下へ押し出して残す）
+    _kiso_foundation_types = data.get("foundation_types") or [data.get("foundation_type")] * num_spans
+    _kiso_rock_types       = data.get("rock_types") or [data.get("rock_type")] * num_spans
+    kiso_segments = _kiso_segments(_kiso_foundation_types, _kiso_rock_types, num_spans)
+
+    # 区間ごとの基礎コンクリート延長（工種ごとの内訳）。09が工種ごとに計算・集計する際に使う。
+    # 種類が1つだけの場合も含めて常に書き出す。
+    kiso_by_kind = []
+    for s0, s1, (seg_ft, seg_rt) in kiso_segments:
+        seg_len_mm = sum(lower_extension[s0:s1 + 1]) * MM
+        if s0 == 0             and koguchi_type in ["left",  "both"]: seg_len_mm -= KOGUCHI_CUT
+        if s1 == num_spans - 1 and koguchi_type in ["right", "both"]: seg_len_mm -= KOGUCHI_CUT
+        kiso_by_kind.append({
+            "foundation_type": seg_ft,
+            "rock_type":       seg_rt,
+            "span_start":      s0,
+            "span_end":        s1,
+            "length_m":        round(seg_len_mm / MM, 3),
+        })
+
+    if len(kiso_segments) > 1:
+        kiso_seg_dim_y = kiso_dim_y
+        kiso_dim_y     = kiso_seg_dim_y - (8.0 * scale)
+
+        for (s0, s1, (seg_ft, seg_rt)), kbk in zip(kiso_segments, kiso_by_kind):
+            seg_x1 = left_end["bx"]  if s0 == 0             else all_shapes[s0]["bottom_line"][0][0]
+            seg_x2 = right_end["bx"] if s1 == num_spans - 1 else all_shapes[s1]["bottom_line"][1][0]
+            seg_y1 = stone_bot_left  if s0 == 0             else \
+                (all_shapes[s0]["bottom_line"][0][1] - _span_kiso_h(s0)[0] - _span_kiso_h(s0)[1])
+            seg_y2 = stone_bot_right if s1 == num_spans - 1 else \
+                (all_shapes[s1]["bottom_line"][1][1] - _span_kiso_h(s1)[0] - _span_kiso_h(s1)[1])
+
+            seg_len_mm = kbk["length_m"] * MM
+
+            _dim = msp.add_linear_dim(
+                base=(seg_x1, kiso_seg_dim_y),
+                p1=(seg_x1, seg_y1), p2=(seg_x2, seg_y2),
+                dimstyle="KISO_DIM_NOTEXT", dxfattribs={"layer": "DIM"}
+            )
+            _dim.render()
+            _fix_arrows_outward(doc, [_dim], 2.5 * scale)
+            seg_label_x = (seg_x1 + seg_x2) / 2.0
+            seg_label_y = kiso_seg_dim_y - text_height * 0.5
+            seg_label = (f"基礎コンクリートL({_foundation_kind_label(seg_ft, seg_rt)})"
+                         f"={seg_len_mm / MM:.2f}m")
+            t = msp.add_mtext(seg_label, dxfattribs={"layer": "DIM", "char_height": text_height, "style": "MS-GOTHIC"})
+            t.dxf.insert = (seg_label_x, seg_label_y)
+            t.dxf.attachment_point = 5
+
     _dim = msp.add_linear_dim(
         base=(kiso_con_x1, kiso_dim_y),
         p1=(kiso_con_x1, stone_bot_left),
@@ -772,7 +946,8 @@ def main(output_dir, scale=50, **kwargs):
                     ratio            = (meji_x - distances[s]) / (distances[s + 1] - distances[s])
                     meji_top_y       = top_els[s]    + (top_els[s+1]    - top_els[s])    * ratio
                     meji_bot_y       = bottom_els[s] + (bottom_els[s+1] - bottom_els[s]) * ratio
-                    meji_stone_bot_y = meji_bot_y - base_concrete_h - crushed_stone_h
+                    _meji_h1, _meji_h2 = _span_kiso_h(s)
+                    meji_stone_bot_y = meji_bot_y - _meji_h1 - _meji_h2
 
                     # ⑥ 点線
                     msp.add_line(
@@ -816,6 +991,7 @@ def main(output_dir, scale=50, **kwargs):
         "spans":               all_shapes,
         "tenba_actual_m":      tenba_actual_mm / MM,
         "kiso_actual_m":       kiso_actual_mm / MM,
+        "kiso_by_kind":        kiso_by_kind,
         "koguchi_deduction_m": koguchi_deduction_mm / MM,
         "meji":                meji_records,
     }

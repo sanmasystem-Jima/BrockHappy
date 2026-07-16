@@ -68,14 +68,78 @@ def _fix_arrows_outward(doc, dim_list, asz):
                 if ((en.x - arr_x)**2 + (en.y - arr_y)**2)**0.5 < asz * 2.5:
                     e.dxf.end   = (arr_x, arr_y, 0)
 
+def _kind_key(foundation_type, rock_type):
+    return (foundation_type, rock_type if foundation_type == "rock" else None)
+
+def _kind_suffix(foundation_type, rock_type):
+    """00_Brock_Tougou.py / 02_Brock_Kiso.py が生成する kiso_data_<suffix>.json のsuffixと一致させる"""
+    if foundation_type == "rock":
+        return {"nangan1": "岩着_軟岩1", "nangan2": "岩着_軟岩2"}.get(rock_type, f"岩着_{rock_type}")
+    return "直接"
+
+def _kind_display_label(foundation_type, rock_type):
+    if foundation_type == "rock":
+        return {"nangan1": "岩着・軟岩Ⅰ", "nangan2": "岩着・軟岩Ⅱ以上"}.get(rock_type, f"岩着・{rock_type}")
+    return "直接基礎"
+
+def _load_kiso_variant(output_dir, cache, foundation_type, rock_type, primary_key):
+    """(foundation_type, rock_type) に対応する kiso_data.json を読み込む（キャッシュ付き）。
+    先頭スパンの種類（primary_key）はサフィックスなしのファイルを使う。"""
+    key = _kind_key(foundation_type, rock_type)
+    if key in cache:
+        return cache[key]
+    if key == primary_key:
+        path = os.path.join(output_dir, "kiso_data.json")
+    else:
+        path = os.path.join(output_dir, f"kiso_data_{_kind_suffix(foundation_type, rock_type)}.json")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    cache[key] = data
+    return data
+
+def _build_jobs(danmen_data):
+    """danmen_data['sections']を、通常/ダブル断面を区別しないフラットなジョブ単位のリストに変換する。
+    各ジョブ: point_idx（測点の物理データ参照用）, point_name, label（表示用）,
+    offset_x, foundation_type, rock_type, embed_m, backfill_bottom_m, points, is_governing
+    （is_governing: 数量表（suryo_data.json）に採用する側。ダブル断面はoutgoing側を採用し、
+    測点数と1:1対応を保つ＝09等の後続ツールとの後方互換のため）"""
+    jobs = []
+    for point_idx, sec in enumerate(danmen_data["sections"]):
+        if sec.get("is_dual"):
+            for side_name, side in (("incoming", sec["incoming"]), ("outgoing", sec["outgoing"])):
+                jobs.append({
+                    "point_idx":  point_idx,
+                    "point_name": sec["point_name"],
+                    "label": f"{sec['point_name']}（{_kind_display_label(side.get('foundation_type'), side.get('rock_type'))}）",
+                    "offset_x":  side["offset_x"],
+                    "foundation_type": side.get("foundation_type"),
+                    "rock_type":       side.get("rock_type"),
+                    "embed_m":            side.get("embed_m"),
+                    "backfill_bottom_m":  side.get("backfill_bottom_m"),
+                    "points": side["points"],
+                    "is_governing": side_name == "outgoing",
+                })
+        else:
+            jobs.append({
+                "point_idx":  point_idx,
+                "point_name": sec["point_name"],
+                "label":      sec["point_name"],
+                "offset_x":   sec["offset_x"],
+                "foundation_type": sec.get("foundation_type"),
+                "rock_type":       sec.get("rock_type"),
+                "embed_m":            sec.get("embed_m"),
+                "backfill_bottom_m":  sec.get("backfill_bottom_m"),
+                "points": sec["points"],
+                "is_governing": True,
+            })
+    return jobs
+
 def load_json_files(output_dir):
     try:
         with open(os.path.join(output_dir, "input.json"), "r", encoding="utf-8") as f:
             raw_input = json.load(f)
         with open(os.path.join(output_dir, "tenba_data.json"), "r", encoding="utf-8") as f:
             output_shape = json.load(f)
-        with open(os.path.join(output_dir, "kiso_data.json"), "r", encoding="utf-8") as f:
-            foundation_data = json.load(f)
         with open(os.path.join(output_dir, "danmen_data.json"), "r", encoding="utf-8") as f:
             danmen_data = json.load(f)
 
@@ -101,11 +165,12 @@ def load_json_files(output_dir):
         ]
         input_data["water_level_els"]     = raw_input.get("water_level_els")
         input_data["foundation_type"]     = raw_input.get("foundation_type", "direct")
+        input_data["rock_type"]           = raw_input.get("rock_type")
 
-        return input_data, output_shape, foundation_data, danmen_data
+        return input_data, output_shape, danmen_data
     except Exception as e:
         print(f"    [エラー] JSON読み込み失敗: {e}")
-        return None, None, None, None
+        return None, None, None
 
 def find_origins_from_basepoints(msp):
     pts = []
@@ -195,11 +260,13 @@ def draw_table(msp, rows, title, ox, oy, txt_h):
 def main(output_dir, scale=50, **kwargs):
     scale = float(scale)
 
-    input_data, output_shape, foundation_data, danmen_data = load_json_files(output_dir)
-    if not all([input_data, output_shape, foundation_data, danmen_data]):
+    input_data, output_shape, danmen_data = load_json_files(output_dir)
+    if not all([input_data, output_shape, danmen_data]):
         return
 
-    foundation_type = foundation_data.get('metadata', {}).get('foundation_type', 'direct')
+    primary_key = _kind_key(input_data["foundation_type"], input_data["rock_type"])
+    kiso_cache  = {}
+    jobs        = _build_jobs(danmen_data)
 
     dxf_in  = os.path.join(output_dir, "danmen.dxf")
     dxf_out = os.path.join(output_dir, "danmen_sunpou.dxf")
@@ -234,10 +301,10 @@ def main(output_dir, scale=50, **kwargs):
             ent.destroy()
 
     origin_points  = find_origins_from_basepoints(msp)
-    num_points     = min(input_data["num_points"], len(origin_points))
+    num_jobs       = min(len(jobs), len(origin_points))
     base_line_type = input_data["base_line_type"]
 
-    if num_points == 0:
+    if num_jobs == 0:
         print("    [エラー] 基準点が見つかりません。05を先に実行してください。")
         return
 
@@ -276,22 +343,28 @@ def main(output_dir, scale=50, **kwargs):
     txt_h_table     = 175.0
     sanren_interval = 8.0 * scale
 
-    kiso_bottom_offset = min(
-        foundation_data['points']['foundation_bottom_front_ext'][1],
-        foundation_data['points']['foundation_bottom_back_ext'][1]
-    )
-
     suryo_sections = []
 
-    for i in range(num_points):
-        p_name    = input_data["point_names"][i]
+    for i in range(num_jobs):
+        job       = jobs[i]
+        pidx      = job["point_idx"]
+        p_name    = job["label"]
         origin    = origin_points[i]
-        embed_d   = input_data["embed_depths"][i]
-        block_h   = input_data["block_heights"][i]
+
+        foundation_type = job["foundation_type"] or input_data["foundation_type"]
+        rock_type       = job["rock_type"]
+        foundation_data = _load_kiso_variant(output_dir, kiso_cache, foundation_type, rock_type, primary_key)
+        kiso_bottom_offset = min(
+            foundation_data["points"]["foundation_bottom_front_ext"][1],
+            foundation_data["points"]["foundation_bottom_back_ext"][1]
+        )
+
+        embed_d   = (job["embed_m"] * 1000.0) if job.get("embed_m") is not None else input_data["embed_depths"][pidx]
+        block_h   = input_data["block_heights"][pidx]
         tenba_h   = input_data["tenba_con_height"]
         hikae     = input_data["block_hikae"]
         uracon    = input_data["ura_con_thickness"]
-        el_val    = input_data["elevations"][i]
+        el_val    = input_data["elevations"][pidx]
         saiseki_w = 300.0
 
         # =========================================================
@@ -314,7 +387,7 @@ def main(output_dir, scale=50, **kwargs):
         h_down     = h_above_gl - tenba_h
 
         # 構造コーナー点をdanmen_dataから取得
-        sec_pts       = danmen_data['sections'][i]['points']
+        sec_pts       = job["points"]
         p_front_kiso  = Vec2(*sec_pts['block_btm_front'])
         p_front_tenba = Vec2(*sec_pts['tenba_btm_front'])
         p_tenba_top   = Vec2(*sec_pts['tenba_top_front'])
@@ -338,8 +411,8 @@ def main(output_dir, scale=50, **kwargs):
 
         # 砕石・裏コンの正しい高さ算出（断面積・寸法線共用）
         _bk_top_ofs    = input_data["backfill_top_offset"]
-        _bf_bot_raw    = (input_data["backfill_bottoms"][i]
-                          if i < len(input_data["backfill_bottoms"]) else None)
+        _bf_bot_raw    = (job["backfill_bottom_m"] * 1000.0 if job.get("backfill_bottom_m") is not None
+                          else (input_data["backfill_bottoms"][pidx] if pidx < len(input_data["backfill_bottoms"]) else None))
         backfill_top_y    = tenba_btm_y - _bk_top_ofs
         # 砕石底の決定（基礎・構造種別により異なる）
         if foundation_type == 'rock':
@@ -353,6 +426,18 @@ def main(output_dir, scale=50, **kwargs):
             backfill_bottom_y = saiseki_bottom_y
         h_saiseki  = backfill_top_y - backfill_bottom_y        # 砕石直高
         h_uracon   = tenba_btm_y - backfill_bottom_y           # 裏コン高さ（tenba_btm → 砕石下面）
+
+        # 岩着基礎：測点ごとのペーライン断面積（底面=固定 + 背面=埋戻し深さに応じて変化）
+        # 02_Brock_Kiso.py の export_dxf_rock 内「ペーラインコンクリート」表と同じ式（m単位）
+        peline_area_m2 = None
+        if foundation_type == 'rock':
+            _peline_t = 0.05  # 02_Brock_Kiso.py の load_project_rock と同じ固定値（50mm）
+            _hikae_m  = hikae / 1000.0
+            _hp_m     = (_bf_bot_raw / 1000.0) if _bf_bot_raw is not None else 0.0
+            _hp_disp  = _hp_m + _hikae_m * front_slope / slope_factor
+            peline_area_m2 = round(
+                (_hikae_m + _peline_t) * _peline_t + _hp_disp * slope_factor * _peline_t, 4
+            )
 
         # 裏砕石下幅（数量表の面積計算と同じ式に統一：砕石底=backfill_bottom_y基準）
         saiseki_bottom_w = saiseki_w + h_uracon * (front_slope - n_bg)
@@ -590,8 +675,8 @@ def main(output_dir, scale=50, **kwargs):
         # 水面EL・水抜きパイプ対象高さ（河川のみ・測点ごと）
         # =========================================================
         water_els = input_data["water_level_els"]
-        if structure_type in ('river', 'river_gohan') and water_els and i < len(water_els) and water_els[i] is not None:
-            wl_el = water_els[i]
+        if structure_type in ('river', 'river_gohan') and water_els and pidx < len(water_els) and water_els[pidx] is not None:
+            wl_el = water_els[pidx]
             wl_y  = origin.y + (wl_el - el_val) * 1000.0
 
             # 水面表示は左側のみ（寸法線群の左端 〜 構造物前面）
@@ -689,17 +774,21 @@ def main(output_dir, scale=50, **kwargs):
         table_y = real_bottom_y - 2000.0
         draw_table(msp, rows, f"断面数量　{p_name}", table_x, table_y, txt_h_table)
 
-        suryo_sections.append({
-            "point_name":      p_name,
-            "hocho_m":         round(hocho_m, 3),
-            "uracon_area_m2":  round(uracon_area, 4),
-            "saiseki_area_m2": round(saiseki_area, 4),
-            "saiseki_h_m":         round(h_saiseki / 1000.0, 3),
-            "saiseki_top_el":      round(saiseki_top_el, 3),
-            "saiseki_bottom_el":   round(saiseki_bottom_el, 3),
-            "block_top_el":        round(block_top_el, 3),
-            "block_bottom_el":     round(block_bottom_el, 3),
-        })
+        # suryo_data.json は測点数と1:1対応を保つ（09等の後続ツールとの後方互換のため）。
+        # ダブル断面（工種境界の測点）は outgoing 側（次スパン側）を代表値として採用する。
+        if job["is_governing"]:
+            suryo_sections.append({
+                "point_name":      job["point_name"],
+                "hocho_m":         round(hocho_m, 3),
+                "uracon_area_m2":  round(uracon_area, 4),
+                "saiseki_area_m2": round(saiseki_area, 4),
+                "saiseki_h_m":         round(h_saiseki / 1000.0, 3),
+                "saiseki_top_el":      round(saiseki_top_el, 3),
+                "saiseki_bottom_el":   round(saiseki_bottom_el, 3),
+                "block_top_el":        round(block_top_el, 3),
+                "block_bottom_el":     round(block_bottom_el, 3),
+                "peline_area_m2":      peline_area_m2,
+            })
 
     suryo_data = {
         "unit": {"length": "m", "area": "m2"},

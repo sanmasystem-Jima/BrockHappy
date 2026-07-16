@@ -289,8 +289,15 @@ def _ask_point_names(data, n):
     print("\n=== 測点名 ===")
     _run_steps_with_undo([(lambda i=i: _ask_point_name_for_point(data, i)) for i in range(n)])
 
+def _pname(data, i):
+    """入力済みの測点名があればそれを、なければ「測点N」を返す"""
+    names = data.get("point_names") or []
+    if i < len(names) and names[i]:
+        return names[i]
+    return f"測点{i+1}"
+
 def _ask_elevation_for_point(data, i):
-    data["elevations"][i] = input_float(f"測点{i+1} 標高", data["elevations"][i])
+    data["elevations"][i] = input_float(f"{_pname(data, i)} 標高", data["elevations"][i])
 
 def _ask_elevations(data, n):
     if "elevations" not in data or len(data["elevations"]) != n:
@@ -372,63 +379,175 @@ def _ask_tenba_con_and_gr(data):
         data["gr_mortar_m"]     = None
         data["gr_kiso_con_m"]   = None
 
-def _ask_foundation_and_rock(data):
-    data["foundation_type"] = input_choice(
-        "=== 基礎形式 ===",
+def _sync_foundation_legacy_fields(data):
+    """02以降（今回未対応）向けの後方互換：先頭スパンの値をスカラーとして保持する。
+    区間ごとに基礎形式が異なる場合は注記を表示する（02〜09の区間対応は今後の作業）。"""
+    fts = data.get("foundation_types") or []
+    rts = data.get("rock_types") or []
+    if not fts:
+        return
+    data["foundation_type"] = fts[0]
+    data["rock_type"] = rts[0] if rts else None
+    if len(set(fts)) > 1:
+        print("  ※ 区間ごとに基礎形式が異なります。断面・数量計算（02以降）は現状"
+              f"先頭スパンの基礎形式（{_FOUNDATION_LABELS.get(fts[0], fts[0])}）を基準に処理されます"
+              "（区間対応は今後の作業予定）。")
+
+def _derive_legacy_embed_depths(data, span):
+    """02以降（今回未対応）向けの後方互換：スパン始点/終点の根入れから測点ごとの配列を導出する。
+    測点i（i<span）はそのスパンの始点側の値、最終測点は最終スパンの終点側の値を採用する
+    （基礎形式が区間で変わる場合、測点上でダブル断面になり得るため、この配列は近似値）。"""
+    starts = data.get("embed_depth_starts") or []
+    ends = data.get("embed_depth_ends") or []
+    if len(starts) != span or len(ends) != span:
+        return
+    data["embed_depths"] = list(starts) + [ends[-1] if ends else None]
+
+def _recompute_rock_embed_depth_for_span(data, i, span):
+    """スパンiが岩着の場合、根入れ（始点・終点とも）を岩盤区分から再計算する。
+    法留は水路基準のため対象外。"""
+    if _is_hatome(data):
+        return
+    if "embed_depth_starts" not in data or len(data["embed_depth_starts"]) != span:
+        data["embed_depth_starts"] = [None] * span
+    if "embed_depth_ends" not in data or len(data["embed_depth_ends"]) != span:
+        data["embed_depth_ends"] = [None] * span
+    fts = data.get("foundation_types") or []
+    rts = data.get("rock_types") or []
+    if i < len(fts) and fts[i] == "rock":
+        rt = rts[i] if i < len(rts) else None
+        val = 0.50 if rt == "nangan1" else 0.30
+        data["embed_depth_starts"][i] = val
+        data["embed_depth_ends"][i] = val
+        _derive_legacy_embed_depths(data, span)
+
+def _ask_foundation_type_for_span(data, i, span):
+    data["foundation_types"][i] = input_choice(
+        f"第{i+1}スパンの基礎形式（{data['point_names'][i]}～{data['point_names'][i+1]}）",
         {"1": ("rock", "岩着基礎"), "2": ("direct", "直接基礎")},
-        data.get("foundation_type")
+        data["foundation_types"][i]
     )
-    if data["foundation_type"] == "rock":
-        data["rock_type"] = input_choice(
-            "=== 岩盤区分 ===",
+    if data["foundation_types"][i] == "rock":
+        data["rock_types"][i] = input_choice(
+            f"第{i+1}スパンの岩盤区分",
             {"1": ("nangan1", "軟岩Ⅰ"), "2": ("nangan2", "軟岩Ⅱ以上")},
-            data.get("rock_type")
+            data["rock_types"][i]
         )
     else:
-        data["rock_type"] = None
+        data["rock_types"][i] = None
+    _sync_foundation_legacy_fields(data)
+    _recompute_rock_embed_depth_for_span(data, i, span)
+
+def _ask_foundation_and_rock(data, span):
+    if "foundation_types" not in data or len(data["foundation_types"]) != span:
+        # 旧形式（スカラーfoundation_type）からの移行: 全スパンに同じ値を引き継ぐ
+        data["foundation_types"] = [data.get("foundation_type")] * span
+    if "rock_types" not in data or len(data["rock_types"]) != span:
+        legacy_rt = data.get("rock_type") if data.get("foundation_type") == "rock" else None
+        data["rock_types"] = [legacy_rt] * span
+    print("\n=== 基礎形式・岩盤区分（スパンごと） ===")
+    _run_steps_with_undo(
+        [(lambda i=i: _ask_foundation_type_for_span(data, i, span)) for i in range(span)]
+    )
 
 def _is_hatome(data):
     return data.get("structure_type") == "road" and data.get("base_line_type") == "front_toe"
 
-def _ask_canal_for_point(data, i):
-    data["has_canal"][i] = input_yesno(f"測点{i+1} 水路の有無", data["has_canal"][i])
-    if data["has_canal"][i] == "y":
-        data["canal_depth"][i] = input_float(
-            f"測点{i+1} 水路の深さ（道路天から水路底, m）", data["canal_depth"][i],
-            min_val=0, max_val=2.0)
+def _ask_canal_start_for_span(data, i, span):
+    if (data["has_canal_starts"][i] is None and i > 0
+            and data["has_canal_ends"][i - 1] is not None):
+        print("  ※ 前スパンの終点側の値を初期値として表示します。")
+        data["has_canal_starts"][i]   = data["has_canal_ends"][i - 1]
+        data["canal_depth_starts"][i] = data["canal_depth_ends"][i - 1]
+    pt = data["point_names"][i]
+    data["has_canal_starts"][i] = input_yesno(
+        f"第{i+1}スパン 始点側（{pt}） 水路の有無", data["has_canal_starts"][i])
+    if data["has_canal_starts"][i] == "y":
+        data["canal_depth_starts"][i] = input_float(
+            f"第{i+1}スパン 始点側（{pt}） 水路の深さ（道路天から水路底, m）",
+            data["canal_depth_starts"][i], min_val=0, max_val=2.0)
     else:
-        data["canal_depth"][i] = 0.0
-    data["embed_depths"][i] = round(data["canal_depth"][i] + 0.3, 3)
+        data["canal_depth_starts"][i] = 0.0
+    data["embed_depth_starts"][i] = round(data["canal_depth_starts"][i] + 0.3, 3)
+    _derive_legacy_embed_depths(data, span)
 
-def _ask_embed_depth_for_point(data, i):
-    data["embed_depths"][i] = input_float(f"測点{i+1} 根入れ", data["embed_depths"][i],
-                                            min_val=0, max_val=2.3, exclusive_min=True)
+def _ask_canal_end_for_span(data, i, span):
+    pt = data["point_names"][i + 1]
+    data["has_canal_ends"][i] = input_yesno(
+        f"第{i+1}スパン 終点側（{pt}） 水路の有無", data["has_canal_ends"][i])
+    if data["has_canal_ends"][i] == "y":
+        data["canal_depth_ends"][i] = input_float(
+            f"第{i+1}スパン 終点側（{pt}） 水路の深さ（道路天から水路底, m）",
+            data["canal_depth_ends"][i], min_val=0, max_val=2.0)
+    else:
+        data["canal_depth_ends"][i] = 0.0
+    data["embed_depth_ends"][i] = round(data["canal_depth_ends"][i] + 0.3, 3)
+    _derive_legacy_embed_depths(data, span)
 
-def _ask_embed_depths(data, n):
+def _ask_embed_start_for_span(data, i, span):
+    current = data["embed_depth_starts"][i]
+    if current is None and i > 0:
+        fts = data.get("foundation_types") or []
+        if i - 1 < len(fts) and fts[i - 1] == fts[i] == "direct":
+            prev_end = data["embed_depth_ends"][i - 1]
+            if prev_end is not None:
+                print(f"  ※ 前スパンの終点側の値を初期値として表示します: {prev_end:g}m")
+                current = prev_end
+    pt = data["point_names"][i]
+    data["embed_depth_starts"][i] = input_float(
+        f"第{i+1}スパン 始点側（{pt}） 根入れ", current,
+        min_val=0, max_val=2.3, exclusive_min=True)
+    _derive_legacy_embed_depths(data, span)
+
+def _ask_embed_end_for_span(data, i, span):
+    pt = data["point_names"][i + 1]
+    data["embed_depth_ends"][i] = input_float(
+        f"第{i+1}スパン 終点側（{pt}） 根入れ", data["embed_depth_ends"][i],
+        min_val=0, max_val=2.3, exclusive_min=True)
+    _derive_legacy_embed_depths(data, span)
+
+def _ask_embed_depths(data, n, span):
+    if "embed_depth_starts" not in data or len(data["embed_depth_starts"]) != span:
+        data["embed_depth_starts"] = [None] * span
+    if "embed_depth_ends" not in data or len(data["embed_depth_ends"]) != span:
+        data["embed_depth_ends"] = [None] * span
+
     if _is_hatome(data):
-        # 法留（岩着・直接共通）：根入れ＝水路の深さ＋30cm（水路なしは道路天から30cm）
-        if "has_canal" not in data or len(data["has_canal"]) != n:
-            data["has_canal"] = [None] * n
-        if "canal_depth" not in data or len(data["canal_depth"]) != n:
-            data["canal_depth"] = [None] * n
-        if "embed_depths" not in data or len(data["embed_depths"]) != n:
-            data["embed_depths"] = [None] * n
-        print("\n=== 水路（測点ごと） ===")
-        _run_steps_with_undo([(lambda i=i: _ask_canal_for_point(data, i)) for i in range(n)])
+        # 法留：根入れ＝水路の深さ＋30cm（水路なしは道路天から30cm）をスパン始点/終点ごとに算出
+        for key in ("has_canal_starts", "has_canal_ends", "canal_depth_starts", "canal_depth_ends"):
+            if key not in data or len(data[key]) != span:
+                data[key] = [None] * span
+        print("\n=== 水路（スパンごと・始点/終点） ===")
         print("  根入れ: 水路底（水路なしは道路天）から30cmで自動算出")
-    elif data["foundation_type"] == "rock":
-        # 岩着は岩盤区分より自動設定
-        t_auto = 0.50 if data["rock_type"] == "nangan1" else 0.30
-        data["embed_depths"] = [t_auto] * n
-        print(f"\n  根入れ: {t_auto*100:.0f}cm（岩盤区分より自動）")
-    else:
-        if "embed_depths" not in data or len(data["embed_depths"]) != n:
-            data["embed_depths"] = [None] * n
-        print("\n=== 根入れ（m・測点ごと） ===")
-        _run_steps_with_undo([(lambda i=i: _ask_embed_depth_for_point(data, i)) for i in range(n)])
+        steps = []
+        for i in range(span):
+            steps.append(lambda i=i: _ask_canal_start_for_span(data, i, span))
+            steps.append(lambda i=i: _ask_canal_end_for_span(data, i, span))
+        _run_steps_with_undo(steps)
+        return
+
+    print("\n=== 根入れ（m・スパンごと・始点/終点） ===")
+    fts = data.get("foundation_types") or []
+    if any(ft == "rock" for ft in fts) and any(ft != "rock" for ft in fts):
+        print("  ※ 岩着スパンは岩盤区分より自動算出、直接基礎スパンは始点側・終点側を入力してください。")
+
+    def _rock_span_step(i):
+        _recompute_rock_embed_depth_for_span(data, i, span)
+        val = data["embed_depth_starts"][i]
+        pt_s, pt_e = data["point_names"][i], data["point_names"][i + 1]
+        print(f"  第{i+1}スパン（{pt_s}～{pt_e}）: {val*100:.0f}cm（岩盤区分より自動）")
+
+    steps = []
+    for i in range(span):
+        if i < len(fts) and fts[i] == "rock":
+            steps.append(lambda i=i: _rock_span_step(i))
+        else:
+            steps.append(lambda i=i: _ask_embed_start_for_span(data, i, span))
+            steps.append(lambda i=i: _ask_embed_end_for_span(data, i, span))
+    _run_steps_with_undo(steps)
 
 def _ask_water_level_for_point(data, i):
-    data["water_level_els"][i] = input_float(f"測点{i+1} 水面EL", data["water_level_els"][i])
+    data["water_level_els"][i] = input_float(f"{_pname(data, i)} 水面EL", data["water_level_els"][i])
 
 def _ask_water_level(data, n):
     if data.get("structure_type") in ("river", "river_gohan"):
@@ -440,7 +559,7 @@ def _ask_water_level(data, n):
         data["water_level_els"] = [None] * n
 
 def _ask_block_height_for_point(data, i):
-    data["block_heights"][i] = input_float(f"測点{i+1} ブロック直高（m）", data["block_heights"][i],
+    data["block_heights"][i] = input_float(f"{_pname(data, i)} ブロック直高（m）", data["block_heights"][i],
                                              min_val=0, max_val=5.0, exclusive_min=True)
 
 def _ask_block_heights(data, n):
@@ -491,36 +610,74 @@ def _ask_backfill_top_offset(data):
     else:
         data["backfill_top_offset"] = None
 
-def _ask_backfill_raw_for_point(data, i):
-    mode = data["backfill_mode"]
-    while True:
-        val = input_float(f"測点{i+1}", data["backfill_raw"][i])
-        if mode == "top_down":
-            computed = data["block_heights"][i] - val if val is not None else None
-        else:  # btm_up
-            computed = val
-        if computed is not None and computed > data["block_heights"][i]:
-            print(f"  ※ 裏込め砕石底面（{computed:g}m）はブロック直高"
-                  f"（{data['block_heights'][i]:g}m）以下にしてください。再入力してください。")
-            continue
-        data["backfill_raw"][i] = val
-        data["backfill_bottoms"][i] = computed
-        break
+def _derive_legacy_backfill_bottoms(data, span):
+    """02以降（今回未対応）向けの後方互換：スパン始点/終点から測点ごとの配列を導出する。
+    測点i（i<span）はそのスパンの始点側の値、最終測点は最終スパンの終点側の値を採用する
+    （基礎形式が区間で変わる場合、測点上でダブル断面になり得るため、この配列は近似値）。"""
+    starts = data.get("backfill_bottom_starts") or []
+    ends   = data.get("backfill_bottom_ends") or []
+    if len(starts) != span or len(ends) != span:
+        return
+    data["backfill_bottoms"] = list(starts) + [ends[-1] if ends else None]
 
-def _ask_backfill_bottoms(data, n):
-    if data["foundation_type"] == "direct" and data["structure_type"] != "road":
-        # 河川直接基礎: 均しコン下（計算段階で決定）
-        print("\n  裏込砕石底面高さ: 均しコンクリート下（自動）")
-        data["backfill_bottoms"] = [None] * n
-        data["backfill_mode"]    = "auto"
-    elif data["foundation_type"] == "direct" and data["structure_type"] == "road":
-        # 道路構造物（道台・法留）の直接基礎: 埋戻し天と砕石下端は必ず一致するため質問不要
-        print("\n  裏込め砕石底面高さ: 前面埋め戻しと同じ高さ（自動）")
-        data["backfill_bottoms"] = list(data["embed_depths"])
-        data["backfill_mode"]    = "embed_same"
-    else:
+def _ask_backfill_start_for_span(data, i, span):
+    mode = data["backfill_mode"]
+    h    = data["block_heights"][i]
+    current = data["backfill_raw_starts"][i]
+    if current is None and i > 0:
+        fts = data.get("foundation_types") or []
+        if i - 1 < len(fts) and fts[i - 1] == fts[i] == "rock":
+            prev_end = data["backfill_raw_ends"][i - 1]
+            if prev_end is not None:
+                print(f"  ※ 前スパンの終点側の値を初期値として表示します: {prev_end:g}m")
+                current = prev_end
+    while True:
+        pt  = data["point_names"][i]
+        val = input_float(f"第{i+1}スパン 始点側（{pt}）", current)
+        computed = (h - val) if (mode == "top_down" and val is not None) else val
+        if computed is not None and computed > h:
+            print(f"  ※ 裏込め砕石底面（{computed:g}m）はブロック直高"
+                  f"（{h:g}m）以下にしてください。再入力してください。")
+            current = val
+            continue
+        data["backfill_raw_starts"][i]    = val
+        data["backfill_bottom_starts"][i] = computed
+        break
+    _derive_legacy_backfill_bottoms(data, span)
+
+def _ask_backfill_end_for_span(data, i, span):
+    mode = data["backfill_mode"]
+    h    = data["block_heights"][i + 1]
+    while True:
+        pt  = data["point_names"][i + 1]
+        val = input_float(f"第{i+1}スパン 終点側（{pt}）", data["backfill_raw_ends"][i])
+        computed = (h - val) if (mode == "top_down" and val is not None) else val
+        if computed is not None and computed > h:
+            print(f"  ※ 裏込め砕石底面（{computed:g}m）はブロック直高"
+                  f"（{h:g}m）以下にしてください。再入力してください。")
+            continue
+        data["backfill_raw_ends"][i]    = val
+        data["backfill_bottom_ends"][i] = computed
+        break
+    _derive_legacy_backfill_bottoms(data, span)
+
+def _ask_backfill_bottoms(data, n, span):
+    if "backfill_bottom_starts" not in data or len(data["backfill_bottom_starts"]) != span:
+        data["backfill_bottom_starts"] = [None] * span
+    if "backfill_bottom_ends" not in data or len(data["backfill_bottom_ends"]) != span:
+        data["backfill_bottom_ends"] = [None] * span
+    if "backfill_raw_starts" not in data or len(data["backfill_raw_starts"]) != span:
+        data["backfill_raw_starts"] = [None] * span
+    if "backfill_raw_ends" not in data or len(data["backfill_raw_ends"]) != span:
+        data["backfill_raw_ends"] = [None] * span
+
+    fts            = data.get("foundation_types") or [data.get("foundation_type")] * span
+    structure_type = data["structure_type"]
+    has_rock_span  = any(ft == "rock" for ft in fts)
+
+    if has_rock_span:
         data["backfill_mode"] = input_choice(
-            "=== 裏込め砕石底面の高さ ===",
+            "=== 裏込め砕石底面の高さ（岩着区間） ===",
             {
                 "1": ("top_down",   "天端からの下がり"),
                 "2": ("embed_same", "前面埋め戻しと同じ高さ"),
@@ -528,20 +685,42 @@ def _ask_backfill_bottoms(data, n):
             },
             data.get("backfill_mode")
         )
-        mode = data["backfill_mode"]
+    else:
+        data["backfill_mode"] = None
+    mode = data["backfill_mode"]
 
-        if mode == "embed_same":
-            data["backfill_bottoms"] = list(data["embed_depths"])
-            data["backfill_raw"]     = [None] * n
+    steps = []
+    for i in range(span):
+        ft = fts[i]
+        if ft == "direct" and structure_type != "road":
+            # 河川・直接基礎区間: 均しコンクリート下（自動、入力不要）
+            data["backfill_bottom_starts"][i] = None
+            data["backfill_bottom_ends"][i]   = None
+        elif ft == "direct" and structure_type == "road":
+            # 道路構造物・直接基礎区間: 前面埋め戻しと同じ高さ（自動）
+            data["backfill_bottom_starts"][i] = data["embed_depth_starts"][i]
+            data["backfill_bottom_ends"][i]   = data["embed_depth_ends"][i]
+        elif mode == "embed_same":
+            # 岩着区間・前面埋め戻しと同じ高さ（自動）
+            data["backfill_bottom_starts"][i] = data["embed_depth_starts"][i]
+            data["backfill_bottom_ends"][i]   = data["embed_depth_ends"][i]
         else:
-            if "backfill_raw" not in data or len(data["backfill_raw"]) != n:
-                data["backfill_raw"] = [None] * n
-            if "backfill_bottoms" not in data or len(data["backfill_bottoms"]) != n:
-                data["backfill_bottoms"] = [None] * n
-            label = "天端からの下がり（m）" if mode == "top_down" \
-                    else "ブロック前面下端からの上がり（m）"
-            print(f"\n=== 裏込め砕石底面  {label} ===")
-            _run_steps_with_undo([(lambda i=i: _ask_backfill_raw_for_point(data, i)) for i in range(n)])
+            # 岩着区間・手入力（天端からの下がり／前面下端からの上がり）
+            steps.append(lambda i=i: _ask_backfill_start_for_span(data, i, span))
+            steps.append(lambda i=i: _ask_backfill_end_for_span(data, i, span))
+
+    if steps:
+        label = "天端からの下がり（m）" if mode == "top_down" \
+                else "ブロック前面下端からの上がり（m）"
+        print(f"\n=== 裏込め砕石底面  {label}（岩着区間・スパンごと） ===")
+        _run_steps_with_undo(steps)
+    elif has_rock_span:
+        print("\n  裏込め砕石底面高さ: 岩着区間は前面埋め戻しと同じ高さ（自動）")
+    if not has_rock_span:
+        print("\n  裏込め砕石底面高さ: 区間の基礎形式に応じて自動算出されます"
+              "（河川・直接=均しコンクリート下／道路・直接=前面埋め戻しと同じ高さ）。")
+
+    _derive_legacy_backfill_bottoms(data, span)
 
 def _ask_koguchi_type(data):
     data["koguchi_type"] = input_choice(
@@ -640,26 +819,43 @@ _KOGUCHI_LABELS    = {"both": "両側あり", "left": "左のみ", "right": "右
 def _review_and_edit(data, n, span):
     while True:
         is_hatome = _is_hatome(data)
-        is_rock   = data.get("foundation_type") == "rock"
         mode      = data.get("backfill_mode")
-
-        if is_hatome:
-            embed_editor = (lambda: _ask_canal_for_point(data, _pick_index("測点", n)))
-        elif is_rock:
-            embed_editor = (lambda: print("  ※ 岩着基礎の根入れは岩盤区分から自動算出されます。"
-                                           "「基礎形式・岩盤区分」の項目で変更してください。"))
-        else:
-            embed_editor = (lambda: _ask_embed_depth_for_point(data, _pick_index("測点", n)))
-
-        if mode in ("top_down", "btm_up"):
-            bottoms_editor = (lambda: _ask_backfill_raw_for_point(data, _pick_index("測点", n)))
-        else:
-            bottoms_editor = (lambda: print("  ※ この基礎形式・条件では裏込め砕石底面は自動算出されます。"))
 
         if span > 0:
             ext_editor = (lambda: _ask_extension_for_span(data, _pick_index("スパン", span)))
+            foundation_editor = (lambda: _ask_foundation_type_for_span(
+                data, _pick_index("スパン", span), span))
+
+            def embed_editor():
+                idx = _pick_index("スパン", span)
+                if is_hatome:
+                    _ask_canal_start_for_span(data, idx, span)
+                    _ask_canal_end_for_span(data, idx, span)
+                    return
+                fts = data.get("foundation_types") or []
+                if idx < len(fts) and fts[idx] == "rock":
+                    print("  ※ このスパンは岩着のため、根入れは岩盤区分から自動算出されます。"
+                          "「基礎形式・岩盤区分」の項目で変更してください。")
+                else:
+                    _ask_embed_start_for_span(data, idx, span)
+                    _ask_embed_end_for_span(data, idx, span)
         else:
             ext_editor = (lambda: print("  ※ スパンがありません。"))
+            foundation_editor = (lambda: print("  ※ スパンがありません。"))
+            embed_editor = (lambda: print("  ※ スパンがありません。"))
+
+        if span > 0:
+            def bottoms_editor():
+                idx = _pick_index("スパン", span)
+                fts = data.get("foundation_types") or []
+                ft  = fts[idx] if idx < len(fts) else None
+                if ft == "rock" and mode in ("top_down", "btm_up"):
+                    _ask_backfill_start_for_span(data, idx, span)
+                    _ask_backfill_end_for_span(data, idx, span)
+                else:
+                    print("  ※ このスパンの基礎形式・条件では裏込め砕石底面は自動算出されます。")
+        else:
+            bottoms_editor = (lambda: print("  ※ スパンがありません。"))
 
         tenba_str = f"あり({_fmt(data.get('tenba_con_height'))}m)" if data.get("has_tenba_con") == "y" else "なし"
         gr_str    = "あり" if data.get("has_gr_kiso") == "y" else "なし"
@@ -681,10 +877,23 @@ def _review_and_edit(data, n, span):
             ("天端コンクリート・GR基礎", f"{tenba_str} / GR{gr_str}",
              lambda: _ask_tenba_con_and_gr(data)),
             ("基礎形式・岩盤区分",
-             f"{_FOUNDATION_LABELS.get(data.get('foundation_type'), '-')} / "
-             f"{_ROCK_LABELS.get(data.get('rock_type'), '-')}",
-             lambda: _ask_foundation_and_rock(data)),
-            ("根入れ",                _fmt_list(data.get("embed_depths")), embed_editor),
+             " / ".join(
+                 f"第{i+1}({_FOUNDATION_LABELS.get(ft, '-')}"
+                 + (f"・{_ROCK_LABELS.get(rt, '-')}" if ft == "rock" else "")
+                 + ")"
+                 for i, (ft, rt) in enumerate(zip(
+                     data.get("foundation_types") or [],
+                     data.get("rock_types") or [None] * span))
+             ) or "-",
+             foundation_editor),
+            ("根入れ",
+             " / ".join(
+                 f"第{i+1}(始{_fmt(s)}/終{_fmt(e)})"
+                 for i, (s, e) in enumerate(zip(
+                     data.get("embed_depth_starts") or [],
+                     data.get("embed_depth_ends") or []))
+             ) or "-",
+             embed_editor),
             ("水面EL",                _fmt_list(data.get("water_level_els")),
              lambda: _ask_water_level_for_point(data, _pick_index("測点", n))),
             ("ブロック直高",          _fmt_list(data.get("block_heights")),
@@ -693,7 +902,14 @@ def _review_and_edit(data, n, span):
              lambda: _ask_backfill_slope(data)),
             ("裏込天端オフセット",    _fmt(data.get("backfill_top_offset")),
              lambda: _ask_backfill_top_offset(data)),
-            ("裏込め砕石底面",        _fmt_list(data.get("backfill_bottoms")), bottoms_editor),
+            ("裏込め砕石底面",
+             " / ".join(
+                 f"第{i+1}(始{_fmt(s)}/終{_fmt(e)})"
+                 for i, (s, e) in enumerate(zip(
+                     data.get("backfill_bottom_starts") or [],
+                     data.get("backfill_bottom_ends") or []))
+             ) or "-",
+             bottoms_editor),
             ("小口止コンクリート",    _KOGUCHI_LABELS.get(data.get("koguchi_type"), "-"),
              lambda: _ask_koguchi_type(data)),
             ("上下延長",
@@ -750,13 +966,13 @@ def main(prev_data=None, prev_folder=None, base_dir=None):
     _ask_elevations(data, n)
     _ask_front_back_conditions(data)
     _ask_tenba_con_and_gr(data)
-    _ask_foundation_and_rock(data)
-    _ask_embed_depths(data, n)
+    _ask_foundation_and_rock(data, span)
+    _ask_embed_depths(data, n, span)
     _ask_water_level(data, n)
     _ask_block_heights(data, n)
     _ask_backfill_slope(data)
     _ask_backfill_top_offset(data)
-    _ask_backfill_bottoms(data, n)
+    _ask_backfill_bottoms(data, n, span)
     _ask_koguchi_type(data)
     _ask_extensions(data, span)
     _ask_back_excavation_slope(data)

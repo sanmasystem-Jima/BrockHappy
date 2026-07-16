@@ -1,3 +1,4 @@
+import glob
 import json
 import os
 import ezdxf
@@ -11,7 +12,7 @@ def load_json(path):
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-SPACING_X = 15000.0   # 05_Brock_Danmen.py の測点間隔（mm）と一致させる
+SPACING_X = 20000.0   # 05_Brock_Danmen.py の測点間隔（mm）と一致させる
 
 def _explode_dimensions_in_place(doc):
     """DIMENSIONエンティティをLINE/INSERT/TEXT等の実体に展開し、元のDIMENSIONを削除する。
@@ -38,6 +39,18 @@ def _section_entities(msp, offset_x, spacing=SPACING_X):
         if x_lo <= cx < x_hi:
             found.append(e)
     return found
+
+def _flatten_section_offsets(danmen_data):
+    """danmen_data['sections']を、通常/ダブル断面（工種が変わる測点）を区別しない
+    offset_xのフラットなリストに変換する（05_Brock_Danmen.pyが描画した順・並びと一致する）。"""
+    offsets = []
+    for sec in danmen_data['sections']:
+        if sec.get('is_dual'):
+            offsets.append(sec['incoming']['offset_x'])
+            offsets.append(sec['outgoing']['offset_x'])
+        else:
+            offsets.append(sec['offset_x'])
+    return offsets
 
 def _koguchi_cluster_extents(cluster):
     """ezdxf bbox.extents()はTEXTの幅をフォント形状(インク幅)から推定するため、
@@ -119,23 +132,30 @@ def main(output_dir, **kwargs):
 
     # 天端詳細図・基礎詳細図・小口止図（任意。無ければ展開図のみで続行）
     tenba_path = os.path.join(output_dir, 'tenba_danmen.dxf')
-    kiso_path = os.path.join(output_dir, 'kiso_danmen.dxf')
     koguchi_path = os.path.join(output_dir, 'koguchi.dxf')
     doc_tb = ezdxf.readfile(tenba_path) if os.path.exists(tenba_path) else None
-    doc_k = ezdxf.readfile(kiso_path) if os.path.exists(kiso_path) else None
     doc_kg = ezdxf.readfile(koguchi_path) if os.path.exists(koguchi_path) else None
     if doc_tb is None:
         print("    [警告] tenba_danmen.dxf が見つかりません（天端詳細図は省略）。")
     else:
         _explode_dimensions_in_place(doc_tb)
-    if doc_k is None:
-        print("    [警告] kiso_danmen.dxf が見つかりません（基礎詳細図は省略）。")
-    else:
-        _explode_dimensions_in_place(doc_k)
     if doc_kg is None:
         print("    [警告] koguchi.dxf が見つかりません（小口止図は省略）。")
     else:
         _explode_dimensions_in_place(doc_kg)
+
+    # 基礎詳細図：基礎形式が区間で複数種類ある場合、kiso_danmen.dxf（先頭スパン）に加えて
+    # kiso_danmen_<種別>.dxf も全部並べて表記する（02_Brock_Kiso.pyが種類の数だけ生成している）
+    kiso_paths = [os.path.join(output_dir, 'kiso_danmen.dxf')]
+    kiso_paths += sorted(glob.glob(os.path.join(output_dir, 'kiso_danmen_*.dxf')))
+    kiso_docs = []
+    for p in kiso_paths:
+        if os.path.exists(p):
+            d = ezdxf.readfile(p)
+            _explode_dimensions_in_place(d)
+            kiso_docs.append(d)
+    if not kiso_docs:
+        print("    [警告] kiso_danmen.dxf が見つかりません（基礎詳細図は省略）。")
 
     scale_tenkai = input_data.get('scale_tenkai', 50)
     scale_danmen = input_data.get('scale_danmen', 50)
@@ -218,8 +238,8 @@ def main(output_dir, **kwargs):
     # 統合canvas換算は sheet_scale を直接掛けるだけでよい
     # （= 用紙mm × sheet_scale。最終的にV-nas側で1/sheet_scaleに縮小されるため、
     #   物理印刷サイズは用紙mmそのものに戻る＝元の1/scale_kiso表示が保たれる）。
-    bbox_tb = bbox_k = None
-    tb_w = tb_h = k_w = k_h = 0.0
+    bbox_tb = None
+    tb_w = tb_h = 0.0
     if doc_tb is not None:
         tenba_blk = combined.blocks.new('TENBA_BLK')
         importer_tb = Importer(doc_tb, combined)
@@ -229,14 +249,16 @@ def main(output_dir, **kwargs):
         tb_w = sheet_scale * (bbox_tb.extmax.x - bbox_tb.extmin.x)
         tb_h = sheet_scale * (bbox_tb.extmax.y - bbox_tb.extmin.y)
 
-    if doc_k is not None:
-        kiso_blk = combined.blocks.new('KISO_BLK')
-        importer_k = Importer(doc_k, combined)
-        importer_k.import_entities(doc_k.modelspace(), target_layout=kiso_blk)
+    # 基礎詳細図：種類の数だけ個別ブロック化し、後段で他の要素と並べて配置する
+    kiso_blocks = []  # (block_name, bbox_local)
+    for i, d in enumerate(kiso_docs):
+        importer_k = Importer(d, combined)
+        block_name = f"KISO_BLK_{i}"
+        blk = combined.blocks.new(block_name)
+        importer_k.import_entities(d.modelspace(), target_layout=blk)
         importer_k.finalize()
-        bbox_k = bbox.extents(doc_k.modelspace(), fast=True)
-        k_w = sheet_scale * (bbox_k.extmax.x - bbox_k.extmin.x)
-        k_h = sheet_scale * (bbox_k.extmax.y - bbox_k.extmin.y)
+        bbox_i = bbox.extents(d.modelspace(), fast=True)
+        kiso_blocks.append((block_name, bbox_i))
 
     # koguchi.dxf は danmen_sunpou.dxf と同じ scale_danmen で生成されている（実寸mm保持・
     # 文字も実寸座標に組み込み済み）ため、danmenと同じ s_d 換算でそのまま統合できる。
@@ -257,8 +279,8 @@ def main(output_dir, **kwargs):
 
     importer_d = Importer(doc_d, combined)
     section_blocks = []  # (block_name, bbox_local, s_d)
-    for i, sec in enumerate(danmen_data['sections']):
-        entities_i = _section_entities(doc_d.modelspace(), sec['offset_x'])
+    for i, offset_x in enumerate(_flatten_section_offsets(danmen_data)):
+        entities_i = _section_entities(doc_d.modelspace(), offset_x)
         if not entities_i:
             continue
         bbox_i = bbox.extents(entities_i, fast=True)
@@ -277,12 +299,15 @@ def main(output_dir, **kwargs):
     tenkai_w = s_t * (bbox_t.extmax.x - bbox_t.extmin.x)
     tenkai_h = s_t * (bbox_t.extmax.y - bbox_t.extmin.y)
 
-    # 上段：展開図の右側に天端詳細図→基礎詳細図を横並び配置
+    # 上段：展開図の右側に天端詳細図→基礎詳細図（種類の数だけ）を横並び配置
     top_items = [('TENKAI_BLK', tenkai_w, tenkai_h)]
     if doc_tb is not None:
         top_items.append(('TENBA_BLK', tb_w, tb_h))
-    if doc_k is not None:
-        top_items.append(('KISO_BLK', k_w, k_h))
+    top_items.extend(
+        (block_name, sheet_scale * (bbox_i.extmax.x - bbox_i.extmin.x),
+         sheet_scale * (bbox_i.extmax.y - bbox_i.extmin.y))
+        for block_name, bbox_i in kiso_blocks
+    )
     top_items.extend(
         (block_name, s_d * (bbox_i.extmax.x - bbox_i.extmin.x), s_d * (bbox_i.extmax.y - bbox_i.extmin.y))
         for block_name, bbox_i in koguchi_blocks
@@ -315,10 +340,9 @@ def main(output_dir, **kwargs):
         bbox_lookup['TENBA_BLK'] = bbox_tb
         scale_lookup['TENBA_BLK'] = sheet_scale
         layer_lookup['TENBA_BLK'] = 'TENBA'
-    if doc_k is not None:
-        bbox_lookup['KISO_BLK'] = bbox_k
-        scale_lookup['KISO_BLK'] = sheet_scale
-        layer_lookup['KISO_BLK'] = 'KISO'
+    bbox_lookup.update({name: b for name, b in kiso_blocks})
+    scale_lookup.update({name: sheet_scale for name, _ in kiso_blocks})
+    layer_lookup.update({name: 'KISO' for name, _ in kiso_blocks})
     bbox_lookup.update({name: b for name, b in koguchi_blocks})
     scale_lookup.update({name: s_d for name, _ in koguchi_blocks})
     layer_lookup.update({name: 'KOGUCHI' for name, _ in koguchi_blocks})

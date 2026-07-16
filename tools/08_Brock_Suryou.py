@@ -363,24 +363,35 @@ def main(output_dir, **kwargs):
     else:  # both
         end_indices = [0] if n_sec == 1 else [0, n_sec - 1]
 
-    foundation_type = input_data.get('foundation_type', 'direct')
+    primary_ft = input_data.get('foundation_type', 'direct')
+
+    # 小口止ごとに、その測点自身の基礎形式（区間対応済み）で計算方法を選ぶ
+    # （左右で基礎形式が異なる場合、プロジェクト全体の代表値では決め打ちしない）
     danmen_msp = None
-    if foundation_type == 'rock':
-        danmen_path = os.path.join(output_dir, 'danmen.dxf')
-        if os.path.exists(danmen_path):
-            danmen_msp = ezdxf.readfile(danmen_path).modelspace()
-        else:
-            print("    [エラー] danmen.dxf が見つかりません（岩着基礎のぺーライン背面抽出に必要）。")
-            return
+    danmen_load_failed = False
+    def _get_danmen_msp():
+        nonlocal danmen_msp, danmen_load_failed
+        if danmen_msp is None and not danmen_load_failed:
+            danmen_path = os.path.join(output_dir, 'danmen.dxf')
+            if os.path.exists(danmen_path):
+                danmen_msp = ezdxf.readfile(danmen_path).modelspace()
+            else:
+                danmen_load_failed = True
+        return danmen_msp
 
     rows = []
     for sec_i in end_indices:
         sec = sections[sec_i]
+        ft  = sec.get('foundation_type') or primary_ft
         pe_bk_pts = None
-        if danmen_msp is not None:
-            sec_entities = _section_entities(danmen_msp, sec['offset_x'])
+        if ft == 'rock':
+            msp_ = _get_danmen_msp()
+            if msp_ is None:
+                print("    [エラー] danmen.dxf が見つかりません（岩着基礎のぺーライン背面抽出に必要）。")
+                return
+            sec_entities = _section_entities(msp_, sec['offset_x'])
             pe_bk_pts = _foundation_pe_bk_points(sec_entities)
-        q = koguchi_quantities(sec['points'], sec['offset_x'], foundation_type, pe_bk_pts)
+        q = koguchi_quantities(sec['points'], sec['offset_x'], ft, pe_bk_pts)
         rows.append((sec['point_name'], q))
 
     total_concrete  = _r3(sum(q['concrete_m3']  for _, q in rows))

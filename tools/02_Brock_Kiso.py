@@ -55,7 +55,7 @@ def calc_quantities(d):
         q["saiseki_m2"] = round(full_w_m * 10.0, 2)
     return q
 
-def export_json(d, output_dir):
+def export_json(d, output_dir, filename="kiso_data.json"):
     offset_val      = 100
     foundation_type = "砕石基礎" if d["type"] == "road" else "均しコンクリート"
 
@@ -80,12 +80,12 @@ def export_json(d, output_dir):
         "quantities":  calc_quantities(d),
     }
 
-    out_path = os.path.join(output_dir, "kiso_data.json")
+    out_path = os.path.join(output_dir, filename)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
     return out_path
 
-def export_dxf(d, scale_n, output_dir):
+def export_dxf(d, scale_n, output_dir, filename="kiso_danmen.dxf"):
     doc = ezdxf.new("R2010", setup=True)
     doc.header['$INSUNITS'] = 4
     msp = doc.modelspace()
@@ -322,7 +322,7 @@ def export_dxf(d, scale_n, output_dir):
         ]
         draw_table(rows, "基礎工　数量表", table_origin_x, table_origin_y)
 
-    out_path = os.path.join(output_dir, "kiso_danmen.dxf")
+    out_path = os.path.join(output_dir, filename)
     doc.saveas(out_path)
     return out_path
 
@@ -357,10 +357,36 @@ def _draw_table(msp, title, subtitle, rows, col_w, t_h, c_h, ox, oy):
                 (rx + 2, ry - c_h/2 - t_h/2))
             rx += w
 
-def load_project_rock(path: str):
+def _rock_variant_pt_hp_pairs(raw, rock_type):
+    """この岩盤区分（rock_type）に該当する測点だけを (測点名, Hp値) で抽出する。
+    区間ごとに基礎形式・岩盤区分が異なる場合、他の工種の測点は対象外にする
+    （旧形式プロジェクト＝区間データが無い場合は全測点の生値をそのまま使う）。"""
+    point_names      = raw.get("point_names", [])
+    foundation_types = raw.get("foundation_types")
+    rock_types       = raw.get("rock_types")
+    starts           = raw.get("backfill_bottom_starts")
+    ends             = raw.get("backfill_bottom_ends")
+
+    if foundation_types is None or rock_types is None or starts is None or ends is None:
+        return [(nm, hp) for nm, hp in zip(point_names, raw.get("backfill_bottoms", [])) if hp is not None]
+
+    pairs = []
+    seen_idx = set()
+    for i, (ft, rt) in enumerate(zip(foundation_types, rock_types)):
+        if ft != "rock" or rt != rock_type:
+            continue
+        if i not in seen_idx and i < len(starts) and starts[i] is not None:
+            pairs.append((point_names[i], starts[i]))
+            seen_idx.add(i)
+        if (i + 1) not in seen_idx and i < len(ends) and ends[i] is not None:
+            pairs.append((point_names[i + 1], ends[i]))
+            seen_idx.add(i + 1)
+    return pairs
+
+def load_project_rock(path: str, rock_type_override=None):
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
-    rock_type   = raw.get("rock_type", "nangan1")
+    rock_type   = rock_type_override or raw.get("rock_type", "nangan1")
     front_slope = float(raw.get("front_slope", 0.3))
     block_hikae = float(raw.get("block_hikae", 0.35))
     if rock_type == "nangan1":
@@ -368,16 +394,15 @@ def load_project_rock(path: str):
     else:
         t_m, N, rock_label = 0.30, 0.1, "軟岩Ⅱ以上"
     return {
-        "rock_type":   rock_type,
-        "rock_label":  rock_label,
-        "t_m":         t_m,
-        "N":           N,
-        "A":           front_slope,
-        "B":           0.10,
-        "peline":      0.05,
-        "block_hikae": block_hikae,
-        "point_names": raw.get("point_names", []),
-        "Hp_list":     raw.get("backfill_bottoms", []),
+        "rock_type":    rock_type,
+        "rock_label":   rock_label,
+        "t_m":          t_m,
+        "N":            N,
+        "A":            front_slope,
+        "B":            0.10,
+        "peline":       0.05,
+        "block_hikae":  block_hikae,
+        "pt_hp_pairs":  _rock_variant_pt_hp_pairs(raw, rock_type),
     }
 
 def calc_quantities_rock(d):
@@ -491,7 +516,7 @@ def _fix_arrows_outward(doc, dim_list, asz):
                     e.dxf.end   = (arr_x, arr_y, 0)
 
 
-def export_json_rock(d, output_dir):
+def export_json_rock(d, output_dir, filename="kiso_data.json"):
     q      = calc_quantities_rock(d)
     A      = d["A"]
     N      = d["N"]
@@ -545,12 +570,12 @@ def export_json_rock(d, output_dir):
         },
         "quantities": q,
     }
-    out_path = os.path.join(output_dir, "kiso_data.json")
+    out_path = os.path.join(output_dir, filename)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=4, ensure_ascii=False)
     return out_path
 
-def export_dxf_rock(d, scale_n, output_dir):
+def export_dxf_rock(d, scale_n, output_dir, filename="kiso_danmen.dxf"):
     doc = ezdxf.new("R2010", setup=True)
     doc.header['$INSUNITS'] = 4
     msp = doc.modelspace()
@@ -565,8 +590,7 @@ def export_dxf_rock(d, scale_n, output_dir):
     hikae  = d["block_hikae"] * 1000
     nobiri = math.sqrt(A**2 + 1)
 
-    pt_names = d.get("point_names", [])
-    Hp_list  = [x for x in d.get("Hp_list", []) if x is not None]
+    pt_hp_pairs = d.get("pt_hp_pairs", [])
 
     # ===== カスタム寸法スタイル（矢印外向き）=====
     txt_h   = 3.5
@@ -764,11 +788,11 @@ def export_dxf_rock(d, scale_n, output_dir):
                  dxfattribs={"height": t_h2}).set_placement((ox_t, oy_t - 10.0))
 
     # ===== 数量表 測点別（ペーラインコンクリート）=====
-    if pt_names and Hp_list:
+    if pt_hp_pairs:
         cw2  = [35.0, 25.0, 40.0]
         oy2  = oy_t - t_h2 * 2 - 15.0
         rows2 = []
-        for nm, hp in zip(pt_names, Hp_list):
+        for nm, hp in pt_hp_pairs:
             hp_m    = float(hp)
             hp_disp = round(hp_m + d["block_hikae"] * A / nobiri, 3)
             area    = round(hp_disp * nobiri * d["peline"], 4)
@@ -780,39 +804,47 @@ def export_dxf_rock(d, scale_n, output_dir):
     cx    = (-(A+N)*t / 2) * s
     y_scl = dim_off + 8.0 + 40.0
     y_ttl = y_scl + 10.0
-    t1 = msp.add_text("岩着基礎", dxfattribs={"height": 7.0})
+    t1 = msp.add_text(f"岩着基礎（{d['rock_label']}）", dxfattribs={"height": 7.0})
     t1.dxf.insert = t1.dxf.align_point = (cx, y_ttl); t1.dxf.halign = 1
     t2 = msp.add_text(f"S=1/{int(scale_n)}", dxfattribs={"height": 5.0})
     t2.dxf.insert = t2.dxf.align_point = (cx, y_scl); t2.dxf.halign = 1
 
-    out_path = os.path.join(output_dir, "kiso_danmen.dxf")
+    out_path = os.path.join(output_dir, filename)
     doc.saveas(out_path)
     return out_path
 
-def main(output_dir, scale=10, **kwargs):
-    print("--- 02_Brock_Kiso ---")
+def main(output_dir, scale=10, foundation_type=None, rock_type=None, suffix=None, **kwargs):
+    """
+    foundation_type/rock_type を指定すると input.json のレガシー scalar より優先して使う
+    （区間ごとに基礎形式が異なるプロジェクトで、種類ごとに複数回呼び出すためのオーバーライド）。
+    suffix を指定すると出力ファイル名に付与する（例: kiso_data_岩着_軟岩1.json）。
+    """
+    print("--- 02_Brock_Kiso ---" + (f"（{suffix}）" if suffix else ""))
     scale_n    = float(scale)
     input_json = os.path.join(output_dir, "input.json")
     if not os.path.exists(input_json):
         print(f"\n[エラー] input.json が見つかりません: {input_json}")
         return
 
+    json_name = f"kiso_data_{suffix}.json"   if suffix else "kiso_data.json"
+    dxf_name  = f"kiso_danmen_{suffix}.dxf"  if suffix else "kiso_danmen.dxf"
+
     try:
         with open(input_json, "r", encoding="utf-8") as _f:
             _raw = json.load(_f)
-        foundation_type = _raw.get("foundation_type", "direct")
+        ft = foundation_type or _raw.get("foundation_type", "direct")
 
-        if foundation_type == "rock":
-            params    = load_project_rock(input_json)
-            dxf_path  = export_dxf_rock(params, scale_n, output_dir)
-            json_path = export_json_rock(params, output_dir)
+        if ft == "rock":
+            params    = load_project_rock(input_json, rock_type_override=rock_type)
+            dxf_path  = export_dxf_rock(params, scale_n, output_dir, dxf_name)
+            json_path = export_json_rock(params, output_dir, json_name)
         else:
             params    = load_project(input_json)
-            dxf_path  = export_dxf(params, scale_n, output_dir)
-            json_path = export_json(params, output_dir)
+            dxf_path  = export_dxf(params, scale_n, output_dir, dxf_name)
+            json_path = export_json(params, output_dir, json_name)
 
-        print(f"    生成成功: kiso_danmen.dxf")
-        print(f"    データ出力成功: kiso_data.json")
+        print(f"    生成成功: {dxf_name}")
+        print(f"    データ出力成功: {json_name}")
     except Exception as e:
         import traceback
         print(f"\n[エラー発生]: {e}")

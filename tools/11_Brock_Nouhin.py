@@ -2,6 +2,7 @@
 # 納品フォルダ作成（最終データのみをまとめてコピー）
 
 import os
+import re
 import json
 import shutil
 import glob
@@ -39,10 +40,15 @@ def main(output_dir, **kwargs):
 
     mod01 = _load_mod01()
     base_name = mod01.make_output_folder_name(data)  # "output_..."
-    nouhin_name = "納品_" + base_name[len("output_"):]
+
+    # outputフォルダに手動で付けた番号プレフィックス（例: "01_"）を納品フォルダ名にも付ける
+    m = re.match(r'^(\d+_)?output_', os.path.basename(output_dir))
+    prefix = (m.group(1) or '') if m else ''
+
+    nouhin_name = prefix + "納品_" + base_name[len("output_"):]
 
     # 古い納品フォルダが残っていれば作り直す（派生コピーのため削除して問題ない）
-    for old in glob.glob(os.path.join(output_dir, "納品_*")):
+    for old in glob.glob(os.path.join(output_dir, "*納品_*")):
         if os.path.isdir(old):
             shutil.rmtree(old)
 

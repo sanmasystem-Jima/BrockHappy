@@ -98,25 +98,28 @@ def _fix_arrows_outward(doc, dim_list, asz):
                     e.dxf.end   = (arr_x, arr_y, 0)
 
 
-def draw(output_dir, scale=50, **kwargs):
+def draw(output_dir, scale=50, indices_override=None, start_draw_i=0, save=True, **kwargs):
     input_data  = load_json(os.path.join(output_dir, 'input.json'))
     danmen_data = load_json(os.path.join(output_dir, 'danmen_data.json'))
     if not all([input_data, danmen_data]):
         print("    [エラー] 必要なJSONファイルが揃っていません。")
         return
 
-    sections     = danmen_data['sections']
-    n_sec        = len(sections)
-    koguchi_type = input_data.get('koguchi_type', 'both')
-    if koguchi_type == 'both':
-        indices = [0, n_sec - 1] if n_sec > 1 else [0]
-    elif koguchi_type == 'left':
-        indices = [0]
-    elif koguchi_type == 'right':
-        indices = [n_sec - 1]
+    sections = danmen_data['sections']
+    n_sec    = len(sections)
+    if indices_override is not None:
+        indices = indices_override
     else:
-        print("    [スキップ] 小口止コンクリートなし")
-        return
+        koguchi_type = input_data.get('koguchi_type', 'both')
+        if koguchi_type == 'both':
+            indices = [0, n_sec - 1] if n_sec > 1 else [0]
+        elif koguchi_type == 'left':
+            indices = [0]
+        elif koguchi_type == 'right':
+            indices = [n_sec - 1]
+        else:
+            print("    [スキップ] 小口止コンクリートなし")
+            return
 
     doc = ezdxf.new('R2010')
     doc.header['$INSUNITS'] = 4
@@ -154,7 +157,7 @@ def draw(output_dir, scale=50, **kwargs):
         sec = sections[sec_i]
         pts = sec['points']
         ox  = sec['offset_x']
-        px  = draw_i * SEC_SPACING
+        px  = (start_draw_i + draw_i) * SEC_SPACING
 
         def lp(key):
             p = pts[key]
@@ -393,8 +396,10 @@ def draw(output_dir, scale=50, **kwargs):
             t.dxf.halign      = 1
             t.dxf.align_point = (center_x, y_pos)
 
-    doc.saveas(os.path.join(output_dir, 'koguchi.dxf'))
-    print("    生成成功: koguchi.dxf")
+    if save:
+        doc.saveas(os.path.join(output_dir, 'koguchi.dxf'))
+        print("    生成成功: koguchi.dxf")
+    return doc
 
 
 if __name__ == "__main__":

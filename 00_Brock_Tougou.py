@@ -109,6 +109,32 @@ def run_tool(tool_filename, output_dir, **kwargs):
             sys.exit(1)
 
 # =========================================================
+# 基礎形式の種類（区間ごとに異なる場合、02を種類の数だけ実行する）
+# =========================================================
+
+_KISO_KIND_LABELS = {"nangan1": "岩着_軟岩1", "nangan2": "岩着_軟岩2"}
+
+def _kiso_kind_label(foundation_type, rock_type):
+    if foundation_type == "rock":
+        return _KISO_KIND_LABELS.get(rock_type, f"岩着_{rock_type}")
+    return "直接"
+
+def _distinct_kiso_kinds(input_data):
+    """(foundation_type, rock_type) の組をスパン順に列挙し重複を除いたリストを返す。
+    先頭は必ず先頭スパン（従来のレガシー scalar と一致）。"""
+    fts = input_data.get("foundation_types") or [input_data.get("foundation_type")]
+    rts = input_data.get("rock_types") or [input_data.get("rock_type")]
+    kinds = []
+    seen = set()
+    for i, ft in enumerate(fts):
+        rt = rts[i] if i < len(rts) else None
+        key = (ft, rt if ft == "rock" else None)
+        if key not in seen:
+            seen.add(key)
+            kinds.append(key)
+    return kinds
+
+# =========================================================
 # メイン処理
 # =========================================================
 
@@ -122,7 +148,20 @@ def run_pipeline(output_dir, input_data):
     scale_tenkai = input_data.get("scale_tenkai", 50)
     scale_danmen = input_data.get("scale_danmen", 50)
 
-    run_tool("02_Brock_Kiso.py",    output_dir, scale=scale_kiso)
+    # 基礎形式・岩盤区分が区間で複数種類ある場合、02を種類の数だけ実行する。
+    # 先頭スパン分は従来通り kiso_data.json / kiso_danmen.dxf（03〜11はこれを読む）。
+    # 2種類目以降は kiso_data_<種別>.json / kiso_danmen_<種別>.dxf として追加生成するのみ
+    # （03〜11側の区間対応は別作業）。
+    kiso_kinds = _distinct_kiso_kinds(input_data)
+    run_tool("02_Brock_Kiso.py", output_dir, scale=scale_kiso)
+    if len(kiso_kinds) > 1:
+        for ft, rt in kiso_kinds[1:]:
+            run_tool("02_Brock_Kiso.py", output_dir, scale=scale_kiso,
+                      foundation_type=ft, rock_type=rt,
+                      suffix=_kiso_kind_label(ft, rt))
+        print(f"    ※ 基礎形式・岩盤区分が{len(kiso_kinds)}種類あるため、"
+              f"02_Brock_Kiso.pyを{len(kiso_kinds)}回実行しました。")
+
     run_tool("03_Brock_Tenba.py",   output_dir, scale=scale_tenba)
     run_tool("04_Brock_Tenkai.py",  output_dir, scale=scale_tenkai)
     run_tool("05_Brock_Danmen.py",  output_dir)
